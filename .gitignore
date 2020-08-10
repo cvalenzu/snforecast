@@ -1,0 +1,6 @@
+*.npy
+*.csv
+*.npz
+__pycache__
+*.pyc
+data/models/*
