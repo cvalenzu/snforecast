@@ -23,10 +23,10 @@ class PhasedLSTM(tf.keras.layers.Layer):
                  name='plstm',
                  **kwargs):
         super(PhasedLSTM, self).__init__(name=name)
-        
+
         self.state_size = [units,units] #This change
         self.output_size = units        #This change
-        
+
         self.units = units
         self._leak = leak_rate
         self._ratio_on = ratio_on
@@ -34,7 +34,7 @@ class PhasedLSTM(tf.keras.layers.Layer):
         self._out_activation = out_activation
         self.period_init_min = period_init_min
         self.period_init_max = period_init_max
-        
+
         self.cell = tf.keras.layers.LSTMCell(units, **kwargs)
 
     def _get_cycle_ratio(self, time, phase, period):
@@ -44,8 +44,8 @@ class PhasedLSTM(tf.keras.layers.Layer):
         time = tf.reshape(time, [tf.shape(time)[0],1]) #This change
         shifted_time = time - phase_casted
         cycle_ratio = (shifted_time%period_casted) / period_casted
-        return tf.cast(cycle_ratio, dtype=tf.float32)        
-        
+        return tf.cast(cycle_ratio, dtype=tf.float32)
+
     def build(self, input_shape):
         self.period = self.add_weight(
                         name="period",
@@ -95,8 +95,8 @@ class PhasedLSTM(tf.keras.layers.Layer):
 
         return new_h, (new_h, new_c)
 
-    
-    
+
+
 class PhasedSNForecastModel(tf.keras.Model):
     def __init__(self, units, out_steps, features, dropout=0.5):
         super().__init__()
@@ -105,7 +105,7 @@ class PhasedSNForecastModel(tf.keras.Model):
         self.features = features
         self.dropout = dropout
         self.concat = tf.keras.layers.Concatenate()
-        self.mask = tf.keras.layers.Masking(mask_value=-1.0)    
+        self.mask = tf.keras.layers.Masking(mask_value=-1.0)
         self._init_dense()
         self._init_recurrent()
 
@@ -148,8 +148,8 @@ class PhasedSNForecastModel(tf.keras.Model):
                 tf.keras.layers.Dropout(self.dropout),
                 dense2,
                 tf.keras.layers.Dropout(self.dropout),
-                dense3, 
-                tf.keras.layers.Dropout(self.dropout), 
+                dense3,
+                tf.keras.layers.Dropout(self.dropout),
                 out]
 
     def call(self, inputs, training=None):
@@ -169,3 +169,111 @@ class PhasedSNForecastModel(tf.keras.Model):
         predictions = tf.stack(predictions)
         predictions = tf.transpose(predictions, [1, 0, 2])
         return predictions
+
+
+class PhasedSNForecastProbabilisticIntervalModel(tf.keras.Model):
+    def __init__(self, units, out_steps, model, dropout=0.5, penalization = 50):
+        super().__init__()
+        self.penalization = penalization
+        self.out_steps = out_steps
+        self.units = units
+        self.dropout = dropout
+        self.concat = tf.keras.layers.Concatenate()
+        self.mask = tf.keras.layers.Masking(mask_value=-1.0)
+        self.rnn = model.rnn
+        self.cells = model.cells
+        self.denses = model.denses
+        for layer in self.cells:
+            layer.traineable = False
+        for layer in self.denses:
+            layer.traineable = False
+        self.rnn.traineable = False
+
+        self._init_dense()
+
+    def recurrent_pass(self,cells, states, x):
+        for i,cell in enumerate(cells):
+            x, states[i] = cell(x, states=states[i], training = False)
+        return x, states
+
+    def dense_pass(self, denses, x):
+        for layer in denses:
+            x = layer(x)
+        return x
+
+    def warmup(self,inputs):
+        x, *states = self.rnn(inputs, training= False)
+        return x,states
+
+
+    def get_denses(self, features = 3):
+        dense1 = tf.keras.layers.Dense(self.units//4, activation="tanh")
+        dense2 = tf.keras.layers.Dense(self.units//8, activation="tanh")
+        dense3 = tf.keras.layers.Dense(self.units//16, activation="tanh")
+
+        out = tf.keras.layers.Dense(features, activation="linear")
+        return [
+        dense1,
+        tf.keras.layers.Dropout(self.dropout),
+        dense2,
+        tf.keras.layers.Dropout(self.dropout),
+        dense3,
+        tf.keras.layers.Dropout(self.dropout),
+        out]
+
+    def _init_dense(self):
+        self.lower = self.get_denses(1)
+        self.upper = self.get_denses(1)
+
+    def get_PICW(self, lower, upper):
+        penalization = tf.expand_dims(tf.cast(self.penalization, upper.dtype), 0)
+        range = tf.where(upper > lower, upper-lower, self.penalization * (lower - upper))
+        return tf.reduce_mean(range,axis=-1)
+
+    def call(self, inputs, training = False):
+        inputs = self.mask(inputs)
+        #Creating empty tensors for predictions
+        predictions = []
+        upper_preds = []
+        lower_preds = []
+
+        x, states = self.warmup(inputs)
+        prediction = self.dense_pass(self.denses, x)
+        upper_pred = self.dense_pass(self.upper, x)
+        lower_pred = self.dense_pass(self.lower, x)
+
+        #Saving first predictions
+        predictions.append(prediction)
+        upper_preds.append(upper_pred)
+        lower_preds.append(lower_pred)
+
+        for n in range(1, self.out_steps):
+            x, states = self.recurrent_pass(self.cells, states, prediction)
+
+            prediction = self.dense_pass(self.denses, x)
+            upper_pred = self.dense_pass(self.upper, x)
+            lower_pred = self.dense_pass(self.lower, x)
+
+
+            predictions.append(prediction)
+            upper_preds.append(upper_pred)
+            lower_preds.append(lower_pred)
+
+        #Stacking predictions
+        predictions = tf.stack(predictions)
+        predictions = tf.transpose(predictions, [1, 0, 2])
+
+        upper_preds = tf.stack(upper_preds)
+        upper_preds = tf.transpose(upper_preds, [1, 0, 2])
+
+        lower_preds = tf.stack(lower_preds)
+        lower_preds = tf.transpose(lower_preds, [1, 0, 2])
+        PICW = self.get_PICW(lower_preds,upper_preds)
+        self.add_metric(PICW,name="PICW")
+        # self.add_loss(PICW)
+
+        return {
+            "prediction":predictions,
+            "lower": lower_preds,
+            "upper": upper_preds
+            }
