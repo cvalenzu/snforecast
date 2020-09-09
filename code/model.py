@@ -67,7 +67,7 @@ class PhasedLSTM(tf.keras.layers.Layer):
                                         trainable=True)
 
     def call(self, input, states):
-        inputs, times = input, input[:,0] #This change
+        inputs, times = input[:,1:], input[:,0] #This change
 
         # =================================
         # CANDIDATE CELL AND HIDDEN STATE
@@ -96,16 +96,26 @@ class PhasedLSTM(tf.keras.layers.Layer):
         return new_h, (new_h, new_c)
 
 
+@tf.function
+def sum_time(inputs):
+    dts = inputs[:,:,0]
+    dts = tf.where(dts < 0.0, 0.0, dts)
+    times = tf.cumsum(dts,axis=1)
+    times = tf.where(inputs[:,:,0] < 0.0, -1.0, times)
+    times = tf.expand_dims(times,axis=-1)
+    times_inputs = tf.concat([times,inputs], axis=-1)
+    return times_inputs
 
 class PhasedSNForecastModel(tf.keras.Model):
-    def __init__(self, units, out_steps, features, dropout=0.5):
-        super().__init__()
+    def __init__(self, units, out_steps, features, dropout=0.5,name="autoencoder", **kwargs):
+        super().__init__(name=name, **kwargs)
         self.out_steps = out_steps
         self.units = units
         self.features = features
         self.dropout = dropout
         self.concat = tf.keras.layers.Concatenate()
         self.mask = tf.keras.layers.Masking(mask_value=-1.0)
+        self.sum_over_time = tf.keras.layers.Lambda(sum_time)
         self._init_dense()
         self._init_recurrent()
 
@@ -127,33 +137,27 @@ class PhasedSNForecastModel(tf.keras.Model):
         return x, state
 
     def warmups(self,inputs):
-#         prediction = self.rnn_batch_norm(inputs)
         prediction,states = self._warmup(self.rnn,self.denses,inputs)
         return prediction,states
 
     def _init_recurrent(self):
         cell1 = PhasedLSTM(self.units, dropout=self.dropout)
-        cell2 = tf.keras.layers.LSTMCell(self.units//2, dropout=self.dropout)
         self.cells = [cell1]
         self.rnn = tf.keras.layers.RNN(self.cells, return_state=True)
 
     def _init_dense(self):
         dense1 = tf.keras.layers.Dense(self.units//4, activation="tanh")
-        dense2 = tf.keras.layers.Dense(self.units//8, activation="tanh")
-        dense3 = tf.keras.layers.Dense(self.units//16, activation="tanh")
-
         out = tf.keras.layers.Dense(self.features, activation="linear")
         self.denses = [
                 dense1,
                 tf.keras.layers.Dropout(self.dropout),
-                dense2,
-                tf.keras.layers.Dropout(self.dropout),
-                dense3,
-                tf.keras.layers.Dropout(self.dropout),
                 out]
 
     def call(self, inputs, training=None):
+        inputs = self.sum_over_time(inputs)
         inputs = self.mask(inputs)
+        
+        last_times = inputs[:,-1,0]
         #Creating empty tensors for predictions
         predictions = []
         prediction, states = self.warmups(inputs)
@@ -161,13 +165,21 @@ class PhasedSNForecastModel(tf.keras.Model):
         #Saving first predictions
         predictions.append(prediction)
 
+        last_times = tf.expand_dims(last_times + prediction[:,0],axis=-1)
+        prediction = tf.concat([prediction, last_times],axis=-1)
+
         for n in range(1, self.out_steps):
             prediction, states = self.fowardpass(self.cells, states, self.denses, prediction, training)
             predictions.append(prediction)
+            last_times = tf.expand_dims(last_times[:,0] + prediction[:,0],axis=-1)
+            prediction = tf.concat([prediction, last_times],axis=-1)
+
 
         #Stacking predictions
         predictions = tf.stack(predictions)
         predictions = tf.transpose(predictions, [1, 0, 2])
+
+        # self.add_loss(self.mae(predicts, predictions))
         return predictions
 
 
@@ -188,6 +200,7 @@ class PhasedSNForecastProbabilisticIntervalModel(tf.keras.Model):
         for layer in self.denses:
             layer.traineable = False
         self.rnn.traineable = False
+        self.sum_over_time = tf.keras.layers.Lambda(sum_time)
 
         self._init_dense()
 
@@ -209,15 +222,12 @@ class PhasedSNForecastProbabilisticIntervalModel(tf.keras.Model):
     def get_denses(self, features = 3):
         dense1 = tf.keras.layers.Dense(self.units//4, activation="tanh")
         dense2 = tf.keras.layers.Dense(self.units//8, activation="tanh")
-        dense3 = tf.keras.layers.Dense(self.units//16, activation="tanh")
 
         out = tf.keras.layers.Dense(features, activation="linear")
         return [
         dense1,
         tf.keras.layers.Dropout(self.dropout),
         dense2,
-        tf.keras.layers.Dropout(self.dropout),
-        dense3,
         tf.keras.layers.Dropout(self.dropout),
         out]
 
@@ -231,7 +241,10 @@ class PhasedSNForecastProbabilisticIntervalModel(tf.keras.Model):
         return tf.reduce_mean(range,axis=-1)
 
     def call(self, inputs, training = False):
+        inputs = self.sum_over_time(inputs)
         inputs = self.mask(inputs)
+        last_times = inputs[:,-1,0]        
+       
         #Creating empty tensors for predictions
         predictions = []
         upper_preds = []
@@ -247,15 +260,21 @@ class PhasedSNForecastProbabilisticIntervalModel(tf.keras.Model):
         upper_preds.append(upper_pred)
         lower_preds.append(lower_pred)
 
+        
+        last_times = tf.expand_dims(last_times + prediction[:,0],axis=-1)
+        prediction = tf.concat([prediction, last_times],axis=-1)
         for n in range(1, self.out_steps):
             x, states = self.recurrent_pass(self.cells, states, prediction)
-
             prediction = self.dense_pass(self.denses, x)
+            predictions.append(prediction)
+
+            last_times = tf.expand_dims(last_times[:,0] + prediction[:,0],axis=-1)
+            prediction = tf.concat([prediction, last_times],axis=-1)
+            
             upper_pred = self.dense_pass(self.upper, x)
             lower_pred = self.dense_pass(self.lower, x)
 
 
-            predictions.append(prediction)
             upper_preds.append(upper_pred)
             lower_preds.append(lower_pred)
 
@@ -270,7 +289,7 @@ class PhasedSNForecastProbabilisticIntervalModel(tf.keras.Model):
         lower_preds = tf.transpose(lower_preds, [1, 0, 2])
         PICW = self.get_PICW(lower_preds,upper_preds)
         self.add_metric(PICW,name="PICW")
-        # self.add_loss(PICW)
+        self.add_loss(PICW)
 
         return {
             "prediction":predictions,
